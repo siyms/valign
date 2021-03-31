@@ -5,7 +5,7 @@
 ;; Author: Yuan Fu <casouri@gmail.com>
 ;; Maintainer: Yuan Fu <casouri@gmail.com>
 ;; URL: https://github.com/casouri/valign
-;; Version: 3.0.0
+;; Version: 3.1.1
 ;; Keywords: convenience, text, table
 ;; Package-Requires: ((emacs "26.0"))
 
@@ -107,9 +107,7 @@
 (require 'cl-lib)
 (require 'pcase)
 
-(defgroup valign
-  '((valign-lighter custom-variable)
-    (valign-fancy-bar custom-variable))
+(defgroup valign nil
   "Visually align text tables on GUI."
   :group 'text)
 
@@ -188,7 +186,9 @@ Doesn’t check if we are in a cell."
     (if (looking-at " [^ ]")
         'left
       (if (not (search-forward "|" nil t))
-          (signal 'valign-parse-error '("Missing the right bar (|)"))
+          (signal
+           'valign-parse-error
+           (list (format "Missing the right bar (|) around %s" (point))))
         (if (looking-back
              "[^ ] |" (max (- (point) 3) (point-min)))
             'right
@@ -252,10 +252,10 @@ right bar."
         ;; as cell content, rather than to consider it as part of the
         ;; padding and add overlay over it.
         (list cell-beg
-              (if (= (- content-beg-strict cell-beg) 1)
+              (if (<= (- content-beg-strict cell-beg) 1)
                   content-beg-strict
                 (1- content-beg-strict))
-              (if (= (- cell-end content-end-strict) 1)
+              (if (<= (- cell-end content-end-strict) 1)
                   content-end-strict
                 (1+ content-end-strict))
               cell-end)))))
@@ -303,47 +303,32 @@ width.  BAR-CHAR is the bar character (“|”)."
 ;; has some limitations, including not working right with face remapping.
 ;; With this function we can avoid some of them.  However we still can’t
 ;; get the true tab width, see comment in ‘valgn--tab-width’ for more.
-(defun valign--pixel-width-from-to (from to &optional with-prefix)
+(defun valign--pixel-width-from-to (from to)
   "Return the width of the glyphs from FROM (inclusive) to TO (exclusive).
 The buffer has to be in a live window.  FROM has to be less than
 TO and they should be on the same line.  Valign display
-properties must be cleaned before using this.
+properties must be cleaned before using this."
+  (- (car (window-text-pixel-size
+           nil (line-beginning-position) to))
+     (+ (car (window-text-pixel-size
+              nil (line-beginning-position) from))
+        ;; HACK: You would expect (window-text-pixel-size WINDOW
+        ;; FROM TO) to return line-number-display-width when FROM
+        ;; equals to TO, but no, it returns 0.
+        (if (eq (line-beginning-position) from)
+            (line-number-display-width 'pixel)
+          0))))
 
-If WITH-PREFIX is non-nil, don’t subtract the width of line
-prefix."
-  ;; HACK: You would expect (window-text-pixel-size WINDOW FROM TO) to
-  ;; return line-number-display-width when FROM equals to TO, but no,
-  ;; it returns 0.  Then if we still subtract line number width, we
-  ;; get a negative number.  So if FROM = TO, we simply return 0.
-  (if (eq from to)
-      0
-    (let* ((window (get-buffer-window))
-           ;; This computes the prefix width.  This trick doesn’t seem
-           ;; work if the point is at the beginning of a line, so we use
-           ;; TO instead of FROM.
-           ;;
-           ;; Why all this fuss: Org puts some display property on
-           ;; white spaces in a cell: like (space :relative-width 1).
-           ;; That messes up the calculation of the prefix: now it
-           ;; returns the width of a space instead of 0 when there is
-           ;; no line prefix.  So we move the test point around until
-           ;; it doesn’t sit on a character with display properties.
-           (line-prefix
-            (let ((pos to))
-              (while (get-char-property pos 'display)
-                (cl-decf pos))
-              (car (window-text-pixel-size window pos pos)))))
-      (- (car (window-text-pixel-size window from to))
-         (if with-prefix 0 line-prefix)
-         (if (bound-and-true-p display-line-numbers-mode)
-             (line-number-display-width 'pixel)
-           0)))))
+(defun valign--pixel-x (point)
+  "Return the x pixel position of POINT."
+  (- (car (window-text-pixel-size nil (line-beginning-position) point))
+     (line-number-display-width 'pixel)))
 
-(defun valign--separator-p ()
+(defun valign--separator-p (&optional point)
   "If the current cell is actually a separator.
-Assume point is after the left bar (“|”)."
-  (or (eq (char-after) ?:) ;; Markdown tables.
-      (eq (char-after) ?-)))
+POINT should be after the left bar (“|”), default to current point."
+  (or (eq (char-after point) ?:) ;; Markdown tables.
+      (eq (char-after point) ?-)))
 
 (defun valign--alignment-from-seperator ()
   "Return the alignment of this column.
@@ -409,23 +394,27 @@ Return t if the dimension is correct, nil if not."
 (defun valign--separator-line-p (&optional charset)
   "Return t if this line is a separator line.
 If the table is a table.el table, you need to specify CHARSET.
+If the table is not a table.el table, DON’T specify CHARSET.
 Assumes the point is at the beginning of the line."
-  (let ((charset (or charset (cdar valign-box-charset-alist))))
-    (and (re-search-forward
-          (rx-to-string `(or ,(valign-box-char 1 charset)
-                             ,(valign-box-char 4 charset)
-                             ,(valign-box-char 7 charset)
-                             ,(valign-box-char 'v charset)))
-          (line-end-position) t)
-         (valign--separator-p))))
+  (save-excursion
+    (skip-chars-forward " \t")
+    (if charset
+        ;; Check for table.el tables.
+        (let ((charset (or charset (cdar valign-box-charset-alist))))
+          (member (char-to-string (char-after))
+                  (list (valign-box-char 1 charset)
+                        (valign-box-char 4 charset)
+                        (valign-box-char 7 charset))))
+      ;; Check for org/markdown tables.
+      (and (eq (char-after) ?|)
+           (valign--separator-p (1+ (point)))))))
 
 (defun valign--calculate-cell-width (limit &optional charset)
   "Return a list of column widths.
 Each column width is the largest cell width of the column.  Start
 from point, stop at LIMIT.  If the table is a table.el table, you
 need to specify CHARSET."
-  (let* ((charset (or charset (cdar valign-box-charset-alist)))
-         (bar-char (valign-box-char 'v charset))
+  (let* ((bar-char (if charset (valign-box-char 'v charset) "|"))
          row-idx column-idx matrix row)
     (ignore row-idx)
     (save-excursion
@@ -438,7 +427,7 @@ need to specify CHARSET."
           (push (reverse row) matrix))))
     ;; Sanity check.
     (unless (valign---check-dimension matrix)
-      (signal 'valign-parse-error '("Missing rows or columns")))
+      (signal 'valign-parse-error '("The number of columns for each row don’t match, maybe a bar (|) is missing?")))
     (setq matrix (valign--transpose (reverse matrix)))
     ;; Add 8 pixels of padding.
     (mapcar (lambda (col) (+ (apply #'max col) 8)) matrix)))
@@ -458,7 +447,7 @@ TYPE must be 'markdown.  Start at point, stop at LIMIT."
           (push (reverse row) matrix))))
     ;; Sanity check.
     (unless (valign---check-dimension matrix)
-      (signal 'valign-parse-error '("Missing rows or columns")))
+      (signal 'valign-parse-error '("The number of columns for each row don’t match, maybe a bar (|) is missing?")))
     (setq matrix (valign--transpose (reverse matrix)))
     (if matrix
         (mapcar #'car matrix)
@@ -483,7 +472,7 @@ TYPE must be 'org.  Start at point, stop at LIMIT."
           (push (reverse row) matrix)))
       ;; Sanity check.
       (unless (valign---check-dimension matrix)
-        (signal 'valign-parse-error '("Missing rows or columns")))
+        (signal 'valign-parse-error '("The number of columns for each row don’t match, maybe a bar (|) is missing?")))
       (setq matrix (valign--transpose (reverse matrix)))
       ;; For each column, we take the majority.
       (mapcar (lambda (col)
@@ -498,17 +487,35 @@ TYPE must be 'org.  Start at point, stop at LIMIT."
   (save-excursion
     (beginning-of-line)
     (skip-chars-forward " \t")
-    (or (eq (char-after) ?|)
-        (and (member (char-to-string (char-after))
-                     (cl-loop for elt in valign-box-charset-alist
-                              for charset = (cdr elt)
-                              collect (valign-box-char 1 charset)
-                              collect (valign-box-char 4 charset)
-                              collect (valign-box-char 7 charset)
-                              collect (valign-box-char 'v charset)))
-             ;; Exclude +<space> (someone uses + as a bullet), not
-             ;; bullet proof but good enough for now.
-             (not (eq (char-after (1+ (point))) ?\s))))))
+    ;; CHAR is the first character, CHAR 2 is the one after it.
+    (let ((char (char-to-string (char-after)))
+          (char2 (when-let ((char (char-after (1+ (point)))))
+                   (char-to-string char))))
+      (or (equal char "|")
+          (cl-loop
+           for elt in valign-box-charset-alist
+           for charset = (cdr elt)
+           if (or (equal char (valign-box-char 'v charset))
+                  (and (equal char
+                              (valign-box-char 1 charset))
+                       (member char2
+                               (list (valign-box-char 2 charset)
+                                     (valign-box-char 3 charset)
+                                     (valign-box-char 'h charset))))
+                  (and (equal char
+                              (valign-box-char 4 charset))
+                       (member char2
+                               (list (valign-box-char 5 charset)
+                                     (valign-box-char 6 charset)
+                                     (valign-box-char 'h charset))))
+                  (and (equal char
+                              (valign-box-char 7 charset))
+                       (member char2
+                               (list (valign-box-char 8 charset)
+                                     (valign-box-char 9 charset)
+                                     (valign-box-char 'h charset)))))
+           return t
+           finally return nil)))))
 
 (defun valign--align-p ()
   "Return non-nil if we should align the table at point."
@@ -668,8 +675,7 @@ COLUMN-WIDTH-LIST is returned by `valign--calculate-cell-width'."
         (space-width (valign--glyph-width-of " " (point)))
         (column-start (point))
         (col-idx 0)
-        (pos (valign--pixel-width-from-to
-              (line-beginning-position) (point) t)))
+        (pos (valign--pixel-x (point))))
     ;; Render the first left bar.
     (valign--maybe-render-bar (1- (point)))
     ;; Add overlay in each column.
@@ -706,7 +712,8 @@ COLUMN-WIDTH-LIST is returned by `valign--calculate-cell-width'."
   :group 'valign)
 
 (defvar valign-signal-parse-error nil
-  "When non-nil, signal parse error.")
+  "When non-nil and ‘debug-on-error’, signal parse error.
+If ‘debug-on-error’ is also non-nil, drop into the debugger.")
 
 (defcustom valign-max-table-size 4000
   "Valign doesn't align tables of size larger than this value.
@@ -748,15 +755,15 @@ at the end of the table."
                                    'face 'valign-table-fallback))))
         (when go-to-end (valign--end-of-table)))
 
-    ((debug valign-parse-error error)
+    ((valign-parse-error error)
      (valign--clean-text-property
       (save-excursion (valign--beginning-of-table) (point))
       (save-excursion (valign--end-of-table) (point)))
-     ;; Ignore parse error when not in debug mode.
-     (if (and (not valign-signal-parse-error)
-              (eq (car err) 'valign-parse-error))
-         nil
-       (signal (car err) (cdr err))))))
+     (when (and (eq (car err) 'valign-parse-error)
+                valign-signal-parse-error)
+       (if debug-on-error
+           (debug 'valign-parse-error)
+         (message "%s" (error-message-string err)))))))
 
 (defun valign-table-1 ()
   "Visually align the table at point."
@@ -776,7 +783,9 @@ at the end of the table."
     ;; Align each row.
     (valign--do-row row-idx table-end
       (unless (search-forward "|" (line-end-position) t)
-        (signal 'valign-parse-error '("Missing the right bar (|)")))
+        (signal 'valign-parse-error
+                (list (format "Missing the right bar (|) around %s"
+                              (point)))))
       (if (valign--separator-p)
           ;; Separator row.
           (valign--align-separator-row column-width-list)
@@ -784,8 +793,7 @@ at the end of the table."
         ;; Not separator row, align each cell. ‘column-start’ is the
         ;; pixel position of the current point, i.e., after the left
         ;; bar.
-        (setq column-start (valign--pixel-width-from-to
-                            (line-beginning-position) (point) t))
+        (setq column-start (valign--pixel-x (point)))
 
         (valign--do-column column-idx "|"
           (save-excursion
@@ -914,8 +922,7 @@ Assumes point is at (2).
                    (t '(4 5 6)))
              charset char-width)
           ;; Render normal line.
-          (setq column-start (valign--pixel-width-from-to
-                              (line-beginning-position) (point) t)
+          (setq column-start (valign--pixel-x (point))
                 column-idx 0)
           (while (search-forward (valign-box-char 'v charset)
                                  (line-end-position) t)
@@ -1053,7 +1060,9 @@ Force align if FORCE non-nil."
 FLAG is the same as in ‘org-flag-region’."
   (when (and valign-mode (not flag))
     (with-silent-modifications
-      (put-text-property beg end 'fontified nil))))
+      ;; Outline has a bug that passes 0 as a buffer position
+      ;; to `org-flag-region', so we need to patch that up.
+      (put-text-property (max 1 beg) end 'fontified nil))))
 
 (defun valign--tab-advice (&rest _)
   "Force realign after tab so user can force realign."
